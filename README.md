@@ -6,15 +6,19 @@ An **unofficial** MCP (Model Context Protocol) server for [Tend](https://tend.co
 
 ## Status
 
-Real, verified against a live HAR capture (2026-08-01) of an actual login → pick studio → pick service → pick time → book flow: `list_studios`, `list_service_types` (static reference data — see below), `list_appointments`, `search_available_slots`, `book_appointment` (confirmed live — the capture includes a real booking that got a real Dentrix `external_id`).
+Real, verified against a live HAR capture (2026-08-01) of an actual login → pick studio → pick service → pick time → book flow, plus live-tested auth: `list_studios`, `list_service_types` (static reference data — see below), `list_appointments`, `search_available_slots`, `book_appointment` (confirmed live — the capture includes a real booking that got a real Dentrix `external_id`).
 
-**Open gap: real login.** The capture started from an already-authenticated browser session, so no login request was ever made — and separately, this particular HAR export had `Authorization`/`Cookie`/`Set-Cookie` headers stripped before the file was even written (looks like newer Chrome versions sanitize HAR exports by default), so even the authenticated requests in it don't reveal the actual session mechanism. `TendClient` currently requires `TEND_COOKIE_HEADER` — a cookie value you copy by hand from DevTools — as a stand-in. See "Filling in real login" below.
+**Auth is fully real now — two ways in.** Tend authenticates via AWS Cognito behind their own thin proxy at `identity.hellotend.com`. You can use either:
+- **`TEND_PASSWORD`** — real email+password login (`POST identity.hellotend.com/login`, confirmed live), the same call the actual web app makes. No Cognito SRP dance needed client-side; Tend's backend handles that.
+- **`TEND_REFRESH_TOKEN`** — skips login, obtained by hand once from DevTools (see below).
+
+Either way, `TendClient` keeps itself signed in automatically: sessions renew via Cognito's `REFRESH_TOKEN_AUTH` (`Authorization: Bearer <idToken>`, ~24h tokens — confirmed live), falling back to a fresh password login if a refresh token expires/gets revoked and `TEND_PASSWORD` is set.
 
 ## Setup
 
 ```bash
 npm install
-cp .env.example .env   # fill in TEND_EMAIL and TEND_COOKIE_HEADER (see below)
+cp .env.example .env   # fill in TEND_EMAIL and (TEND_PASSWORD or TEND_REFRESH_TOKEN)
 npm run dev             # or: npm run build && npm start
 ```
 
@@ -26,26 +30,25 @@ Point an MCP client (Claude Desktop, etc.) at it by adding to its MCP config, e.
     "tend": {
       "command": "node",
       "args": ["/absolute/path/to/tend-mcp/dist/index.js"],
-      "env": { "TEND_EMAIL": "you@example.com", "TEND_COOKIE_HEADER": "..." }
+      "env": { "TEND_EMAIL": "you@example.com", "TEND_PASSWORD": "..." }
     }
   }
 }
 ```
 
-## Filling in real login
+## Getting a refresh token (if not using TEND_PASSWORD)
 
-`TEND_COOKIE_HEADER` is manual and short-lived (dies whenever that browser session does), which is fine for your own testing but not something to ship to anyone else. To make it real:
+1. Log into [hellotend.com](https://hellotend.com) in Chrome.
+2. Open DevTools → **Application → Cookies** → `hellotend.com`.
+3. Copy the value of the `refreshToken` cookie into `TEND_REFRESH_TOKEN`.
 
-1. Open a **private/incognito** Chrome window (so you start logged out), open DevTools → Network → Fetch/XHR, then log into [hellotend.com](https://hellotend.com).
-2. Capture the login request(s) — likely a POST somewhere under `api.hellotend.com`, possibly multi-step if there's email verification/OTP.
-3. Check DevTools' **Application → Cookies** panel for `hellotend.com`/`api.hellotend.com` right after login — that tells you the actual session cookie *name* (not just the value the HAR/header capture won't show you), and whether it's `HttpOnly`/`Secure`/`SameSite`.
-4. Update `TendClient`'s `request()` in `tendClient.ts` to perform that login call and manage the resulting cookie itself (axios with a cookie jar, e.g. `axios-cookiejar-support` + `tough-cookie`, since Node's `axios` doesn't do browser-style cookie jars on its own) instead of requiring `TEND_COOKIE_HEADER`.
-
-If you export a HAR to work from: **don't assume Chrome's stripping protects you** — that behavior isn't guaranteed across versions/export methods, and response *bodies* (not just headers) still contain real PII regardless. Scrub `Authorization`/`Cookie`/`Set-Cookie` header values yourself before sharing one, and redact personal fields (name, email, phone, insurance, DOB) out of response bodies rather than assuming the tool did it for you. `.gitignore` here already excludes `*.har` so it won't land in git.
+**Both `TEND_PASSWORD` and `TEND_REFRESH_TOKEN` are standing credentials — treat them like a password, not an API key.** A refresh token in particular can mint fresh sessions for a long time without re-entering anything. Never commit either, never paste either anywhere it might get logged — including into an AI chat. This isn't hypothetical: building this integration involved two real accidental exposures of live tokens into a chat session (once from a raw cookie paste, once from an incomplete redaction script missing `token` as a sensitive field name) — HAR "sanitization" and ad-hoc redaction scripts are not something to rely on. If you ever suspect either has leaked, log out of Tend everywhere / rotate your password.
 
 ## Adding another endpoint
 
-Same process as above (steps 1-2), then add a method to `TendClient` following the existing ones' shape (raw snake_case API fields mapped to a camelCase TS interface) and a corresponding tool in `tools.ts`.
+Log into hellotend.com, open DevTools → Network → Fetch/XHR, perform the action, and note the request. Then add a method to `TendClient` following the existing ones' shape (raw snake_case API fields mapped to a camelCase TS interface) and a corresponding tool in `tools.ts`.
+
+If you export a HAR to work from: response *bodies* (not just headers) still contain real PII — redact personal fields (name, email, phone, insurance, DOB) out of them before sharing, and never share cookie/token values regardless of what the export tool does or doesn't strip automatically. `.gitignore` here already excludes `*.har` so it won't land in git.
 
 ## Design constraints (please keep these)
 

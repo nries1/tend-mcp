@@ -1,46 +1,74 @@
 // ---------------------------------------------------------------------------
 // Unofficial Tend Dental API client. Tend has no public developer API — this
 // talks to internal endpoints their own web app (hellotend.com) calls,
-// reverse-engineered from a HAR capture on 2026-08-01 covering: login (via
-// an already-valid browser session — see the auth note below), list offices,
-// select office, select appointment type, list available times, and book.
+// reverse-engineered from two HAR captures: 2026-08-01 (already-logged-in
+// session — booking flow, GraphQL patient lookup) and a follow-up capture of
+// a real logged-out -> logged-in flow, which revealed real login.
 //
-// Auth is the one real open gap. The captured session never showed a login
-// POST (the browser was already authenticated), and Chrome's HAR export
-// strips Authorization/Cookie/Set-Cookie headers before writing the file, so
-// even an authenticated request in the capture doesn't reveal the mechanism.
-// What we do know: it's not a bearer token in a request body or a custom
-// header (none appeared anywhere), and the API sends
-// `access-control-allow-credentials: true`, consistent with a same-site
-// session cookie. Confirming the actual cookie name and the real login
-// request needs a fresh HAR captured from a logged-out state (private
-// window). Until then, TEND_COOKIE_HEADER below is a manual bridge.
+// Auth: Tend authenticates via AWS Cognito (user pool us-east-1_20Y4JZuKy,
+// app client 6oinjm62ui6cee747nrd2u90um — the client ID identifies Tend's
+// own web app, not a per-user secret, same as any public OAuth client_id),
+// but fronts it with their own thin proxy rather than exposing raw Cognito
+// SRP to the browser:
+//   - Real login: `POST https://identity.hellotend.com/login` with plain
+//     JSON `{username, password}` (username = email) — no Cognito
+//     SRP/USER_PASSWORD_AUTH dance client-side, Tend's backend handles that
+//     internally. Returns `{idToken, accessToken, refreshToken}` directly.
+//   - Session renewal: Cognito's own `InitiateAuth` REFRESH_TOKEN_AUTH flow
+//     (COGNITO_ENDPOINT below), using the refreshToken from login. No
+//     password needed for this, confirmed live; the refresh token isn't
+//     rotated on use, so it's reusable for a long time (Cognito refresh
+//     tokens are typically valid 30-60 days).
+//   - API calls: `Authorization: Bearer <idToken>` (NOT a cookie — an
+//     idToken cookie alone gets rejected, confirmed live). idToken is a
+//     ~24h JWT.
+//
+// Either credential works standalone: password logs in fresh and captures
+// a refreshToken for subsequent renewals; a refreshToken obtained by hand
+// (DevTools -> Application -> Cookies -> `refreshToken`) skips login
+// entirely. Treat both like a password, not an API key — a refreshToken in
+// particular is a long-lived standing credential, not a short-lived
+// session artifact.
 // ---------------------------------------------------------------------------
 
 import axios, { type AxiosInstance } from 'axios'
 
 const BASE_URL = 'https://api.hellotend.com'
+const IDENTITY_BASE_URL = 'https://identity.hellotend.com'
+const COGNITO_ENDPOINT = 'https://cognito-idp.us-east-1.amazonaws.com/'
+const COGNITO_CLIENT_ID = '6oinjm62ui6cee747nrd2u90um'
 
 export interface TendConfig {
   email: string
+  /** Tend account password. Used once to obtain a refreshToken if one isn't already provided. */
+  password?: string
   /**
-   * Raw `Cookie:` request header value, copied from DevTools' Network tab
-   * (Headers view of any authenticated request — NOT a HAR export, which
-   * strips it) while logged into hellotend.com. Interim stand-in for real
-   * login() until the actual auth flow is captured; stops working whenever
-   * that browser session expires or you log out, so needs periodic manual
-   * refreshing. Never commit this value.
+   * Cognito refresh token. If provided, skips password login entirely. If
+   * omitted but `password` is set, obtained automatically on first use and
+   * kept in memory for the process lifetime (not persisted back to .env).
    */
-  cookieHeader?: string
+  refreshToken?: string
 }
 
 export function configFromEnv(): TendConfig {
   const email = process.env.TEND_EMAIL
+  const password = process.env.TEND_PASSWORD || undefined
+  const refreshToken = process.env.TEND_REFRESH_TOKEN || undefined
   if (!email) throw new TendApiError('Missing TEND_EMAIL environment variable')
-  return {
-    email,
-    cookieHeader: process.env.TEND_COOKIE_HEADER || undefined,
+  if (!password && !refreshToken) {
+    throw new TendApiError('Set either TEND_PASSWORD or TEND_REFRESH_TOKEN (see README)')
   }
+  return { email, password, refreshToken }
+}
+
+// Decodes a JWT's `exp` claim without verifying the signature — fine here
+// since we only ever use tokens we just received directly from Tend/Cognito
+// ourselves, ownership is not in question.
+function decodeJwtExpiresAt(token: string): number {
+  const payload = token.split('.')[1]
+  const json = Buffer.from(payload, 'base64url').toString('utf8')
+  const { exp } = JSON.parse(json) as { exp: number }
+  return exp * 1000
 }
 
 export class TendApiError extends Error {}
@@ -198,10 +226,90 @@ interface RawBookedAppointment {
 
 export class TendClient {
   private http: AxiosInstance
+  private cognito: AxiosInstance
+  private identity: AxiosInstance
   private patientId: string | null = null
+  private idToken: string | null = null
+  private idTokenExpiresAt = 0
+  // Populated from config, or from a password login's response if config
+  // didn't already provide one. Kept in memory only — never written back to
+  // .env, so a password-only setup re-logs-in every process restart rather
+  // than persisting a refresh token to disk on your behalf.
+  private refreshToken: string | undefined
 
   constructor(private config: TendConfig) {
-    this.http = axios.create({ baseURL: BASE_URL, timeout: 10_000, withCredentials: true })
+    this.http = axios.create({ baseURL: BASE_URL, timeout: 10_000 })
+    this.cognito = axios.create({ timeout: 10_000 })
+    this.identity = axios.create({ baseURL: IDENTITY_BASE_URL, timeout: 10_000 })
+    this.refreshToken = config.refreshToken
+  }
+
+  // Real login — POSTs directly to Tend's own auth proxy, not raw Cognito.
+  private async login(): Promise<void> {
+    if (!this.config.password) {
+      throw new TendApiError('No password configured — cannot log in (see TendConfig.password)')
+    }
+    const res = await this.identity.post<{
+      idToken: string
+      accessToken: string
+      refreshToken: string
+    }>('/login', { username: this.config.email, password: this.config.password })
+
+    this.idToken = res.data.idToken
+    this.idTokenExpiresAt = decodeJwtExpiresAt(res.data.idToken)
+    this.refreshToken = res.data.refreshToken
+  }
+
+  // Session renewal via Cognito directly — used once we have a refresh
+  // token, whether it came from config or from a prior login() call here.
+  private async refreshSession(): Promise<void> {
+    const res = await this.cognito.post<{
+      AuthenticationResult?: { IdToken: string; ExpiresIn: number }
+    }>(
+      COGNITO_ENDPOINT,
+      {
+        AuthFlow: 'REFRESH_TOKEN_AUTH',
+        ClientId: COGNITO_CLIENT_ID,
+        AuthParameters: { REFRESH_TOKEN: this.refreshToken },
+      },
+      {
+        headers: {
+          'Content-Type': 'application/x-amz-json-1.1',
+          'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth',
+        },
+      }
+    )
+
+    const result = res.data.AuthenticationResult
+    if (!result) {
+      throw new TendApiError(
+        'Cognito refresh failed — the refresh token is likely expired or revoked. ' +
+          (this.config.password
+            ? 'Will fall back to password login on next attempt.'
+            : 'Get a fresh one from DevTools or set TEND_PASSWORD (see README).')
+      )
+    }
+    this.idToken = result.IdToken
+    this.idTokenExpiresAt = Date.now() + result.ExpiresIn * 1000
+    // Cognito's refresh response doesn't include a new refreshToken (not
+    // rotated on use here, confirmed live) — this.refreshToken stays valid.
+  }
+
+  private async ensureIdToken(): Promise<string> {
+    if (this.idToken && this.idTokenExpiresAt > Date.now() + 60_000) return this.idToken
+
+    if (this.refreshToken) {
+      try {
+        await this.refreshSession()
+        return this.idToken!
+      } catch (err) {
+        if (!this.config.password) throw err
+        // Fall through to password login below.
+      }
+    }
+
+    await this.login()
+    return this.idToken!
   }
 
   private async request<T>(
@@ -209,17 +317,13 @@ export class TendClient {
     path: string,
     opts: { params?: Record<string, unknown>; data?: unknown } = {}
   ): Promise<T> {
-    if (!this.config.cookieHeader) {
-      throw new TendApiError(
-        'No session available. Real login() is not implemented yet (auth flow unknown — see tendClient.ts header comment); set TEND_COOKIE_HEADER as an interim bridge (see README).'
-      )
-    }
+    const idToken = await this.ensureIdToken()
     const res = await this.http.request<T>({
       method,
       url: path,
       params: opts.params,
       data: opts.data,
-      headers: { Cookie: this.config.cookieHeader },
+      headers: { Authorization: `Bearer ${idToken}` },
     })
     return res.data
   }
