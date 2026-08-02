@@ -1,21 +1,48 @@
 {
   "name": "tend-mcp",
   "version": "0.1.0",
-  "description": "Unofficial MCP server for Tend Dental — not affiliated with or endorsed by Tend.",
+  "description": "Unofficial MCP server (and TypeScript client library) for Tend Dental — not affiliated with or endorsed by Tend.",
   "type": "module",
   "bin": {
-    "tend-mcp": "./dist/index.js"
+    "tend-mcp": "dist/index.js"
   },
-  "main": "./dist/index.js",
+  "main": "./dist/cjs/lib.js",
+  "types": "./dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js",
+      "require": "./dist/cjs/lib.js"
+    }
+  },
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "start": "node dist/index.js",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "files": [
     "dist"
   ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "tend",
+    "dental",
+    "appointments",
+    "booking"
+  ],
+  "license": "MIT",
+  "author": "Nick-Beam",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nries1/tend-mcp.git"
+  },
+  "homepage": "https://github.com/nries1/tend-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/nries1/tend-mcp/issues"
+  },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
     "axios": "^1.18.1",
