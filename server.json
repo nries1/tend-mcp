@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nries1/tend-mcp",
+  "description": "Unofficial MCP server for Tend Dental appointment booking. Not affiliated with Tend.",
+  "repository": {
+    "url": "https://github.com/nries1/tend-mcp",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "tend-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Your Tend account email.",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": false,
+          "name": "TEND_EMAIL"
+        },
+        {
+          "description": "Your Tend account password. Set this OR TEND_REFRESH_TOKEN, not both required.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "TEND_PASSWORD"
+        },
+        {
+          "description": "A Cognito refresh token obtained by hand from DevTools (see README). Alternative to TEND_PASSWORD.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "TEND_REFRESH_TOKEN"
+        }
+      ]
+    }
+  ]
+}
