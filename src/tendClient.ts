@@ -73,6 +73,28 @@ function decodeJwtExpiresAt(token: string): number {
 
 export class TendApiError extends Error {}
 
+// Converts a raw axios failure into a TendApiError carrying only a safe
+// message string. This matters beyond tidiness: an unwrapped AxiosError's
+// `.config` includes the full request — headers (Authorization: Bearer
+// <idToken>) and body (login's password, refresh's REFRESH_TOKEN) verbatim.
+// If a caller's logger ever serializes a raw error object (`logger.error({
+// err, ... })`, a common pattern — see papushome's tendBooking.ts), those
+// values would land in log storage. `err.message` alone (e.g. "Request
+// failed with status code 401") never includes them, so every axios call
+// site in this class must go through this rather than let errors propagate
+// unwrapped.
+function toApiError(err: unknown, context: string): TendApiError {
+  if (axios.isAxiosError(err)) {
+    const detail =
+      typeof err.response?.data === 'object' && err.response?.data
+        ? ((err.response.data as Record<string, unknown>).detail ??
+          (err.response.data as Record<string, unknown>).message)
+        : undefined
+    return new TendApiError(`${context}: ${detail ?? err.message}`)
+  }
+  return new TendApiError(`${context}: ${err instanceof Error ? err.message : String(err)}`)
+}
+
 // ---------------------------------------------------------------------------
 // Static reference data. Tend has no "list studios" / "list service types"
 // API endpoint we could find — every studio/service-type value below was
@@ -249,38 +271,47 @@ export class TendClient {
     if (!this.config.password) {
       throw new TendApiError('No password configured — cannot log in (see TendConfig.password)')
     }
-    const res = await this.identity.post<{
-      idToken: string
-      accessToken: string
-      refreshToken: string
-    }>('/login', { username: this.config.email, password: this.config.password })
+    try {
+      const res = await this.identity.post<{
+        idToken: string
+        accessToken: string
+        refreshToken: string
+      }>('/login', { username: this.config.email, password: this.config.password })
 
-    this.idToken = res.data.idToken
-    this.idTokenExpiresAt = decodeJwtExpiresAt(res.data.idToken)
-    this.refreshToken = res.data.refreshToken
+      this.idToken = res.data.idToken
+      this.idTokenExpiresAt = decodeJwtExpiresAt(res.data.idToken)
+      this.refreshToken = res.data.refreshToken
+    } catch (err) {
+      throw toApiError(err, 'Login failed')
+    }
   }
 
   // Session renewal via Cognito directly — used once we have a refresh
   // token, whether it came from config or from a prior login() call here.
   private async refreshSession(): Promise<void> {
-    const res = await this.cognito.post<{
-      AuthenticationResult?: { IdToken: string; ExpiresIn: number }
-    }>(
-      COGNITO_ENDPOINT,
-      {
-        AuthFlow: 'REFRESH_TOKEN_AUTH',
-        ClientId: COGNITO_CLIENT_ID,
-        AuthParameters: { REFRESH_TOKEN: this.refreshToken },
-      },
-      {
-        headers: {
-          'Content-Type': 'application/x-amz-json-1.1',
-          'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth',
+    let result: { IdToken: string; ExpiresIn: number } | undefined
+    try {
+      const res = await this.cognito.post<{
+        AuthenticationResult?: { IdToken: string; ExpiresIn: number }
+      }>(
+        COGNITO_ENDPOINT,
+        {
+          AuthFlow: 'REFRESH_TOKEN_AUTH',
+          ClientId: COGNITO_CLIENT_ID,
+          AuthParameters: { REFRESH_TOKEN: this.refreshToken },
         },
-      }
-    )
+        {
+          headers: {
+            'Content-Type': 'application/x-amz-json-1.1',
+            'X-Amz-Target': 'AWSCognitoIdentityProviderService.InitiateAuth',
+          },
+        }
+      )
+      result = res.data.AuthenticationResult
+    } catch (err) {
+      throw toApiError(err, 'Cognito refresh failed')
+    }
 
-    const result = res.data.AuthenticationResult
     if (!result) {
       throw new TendApiError(
         'Cognito refresh failed — the refresh token is likely expired or revoked. ' +
@@ -318,14 +349,18 @@ export class TendClient {
     opts: { params?: Record<string, unknown>; data?: unknown } = {}
   ): Promise<T> {
     const idToken = await this.ensureIdToken()
-    const res = await this.http.request<T>({
-      method,
-      url: path,
-      params: opts.params,
-      data: opts.data,
-      headers: { Authorization: `Bearer ${idToken}` },
-    })
-    return res.data
+    try {
+      const res = await this.http.request<T>({
+        method,
+        url: path,
+        params: opts.params,
+        data: opts.data,
+        headers: { Authorization: `Bearer ${idToken}` },
+      })
+      return res.data
+    } catch (err) {
+      throw toApiError(err, `${method} ${path} failed`)
+    }
   }
 
   // Every REST endpoint below needs the patient's internal UUID, not their
