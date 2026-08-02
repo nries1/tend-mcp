@@ -1,8 +1,9 @@
 {
   "name": "tend-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Unofficial MCP server (and TypeScript client library) for Tend Dental — not affiliated with or endorsed by Tend.",
   "type": "module",
+  "mcpName": "io.github.nries1/tend-mcp",
   "bin": {
     "tend-mcp": "dist/index.js"
   },
